@@ -66,4 +66,4 @@ To change the key, edit this file or delete it and start the program again.
 
 ## License
 
-Not specified yet.
+MIT License
