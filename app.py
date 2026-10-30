@@ -1,6 +1,7 @@
 import getpass
 import json
 import os
+import sys
 from pathlib import Path
 
 from google import genai
@@ -13,7 +14,12 @@ CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 WORK_DIR = Path.cwd().resolve()
 MAX_READ_BYTES = 100_000
 MAX_LIST_ENTRIES = 200
+MAX_VISIBLE_MODELS = 10
+EXCLUDED_MODEL_PARTS = (
+    "tts", "image", "embedding", "live", "audio", "robotics", "computer-use", "aqa",
+)
 PURPLE = "\033[35m"
+GREEN = "\033[32m"
 RESET = "\033[0m"
 
 
@@ -157,6 +163,113 @@ def write_file(path: str, content: str) -> str:
 CHAT_CONFIG = types.GenerateContentConfig(tools=[list_files, read_file, write_file])
 
 
+def read_key() -> str:
+    """Block until a key is pressed and return 'up', 'down', 'enter' or ''."""
+    if os.name == "nt":
+        import msvcrt
+
+        char = msvcrt.getwch()
+        if char in ("\x00", "\xe0"):
+            return {"H": "up", "P": "down"}.get(msvcrt.getwch(), "")
+        if char == "\r":
+            return "enter"
+        if char == "\x03":
+            raise KeyboardInterrupt
+        return ""
+
+    import select
+    import termios
+    import tty
+
+    fd = sys.stdin.fileno()
+    old_settings = termios.tcgetattr(fd)
+    try:
+        tty.setcbreak(fd)
+        char = os.read(fd, 1)
+        if char == b"\x1b":
+            if select.select([fd], [], [], 0.05)[0]:
+                return {b"[A": "up", b"[B": "down"}.get(os.read(fd, 2), "")
+            return ""
+        if char in (b"\r", b"\n"):
+            return "enter"
+        return ""
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def choose_model(models: list[str], current: str) -> str:
+    index = models.index(current) if current in models else 0
+    top = 0
+    printed = 0
+
+    print("Choose a model (Up/Down to move, Enter to confirm):")
+    while True:
+        if index < top:
+            top = index
+        elif index >= top + MAX_VISIBLE_MODELS:
+            top = index - MAX_VISIBLE_MODELS + 1
+
+        lines = []
+        for position in range(top, min(top + MAX_VISIBLE_MODELS, len(models))):
+            if position == index:
+                lines.append(f"{GREEN}> {models[position]}{RESET}")
+            else:
+                lines.append(f"  {models[position]}")
+
+        if printed:
+            sys.stdout.write(f"\033[{printed}A\033[J")
+        sys.stdout.write("\n".join(lines) + "\n")
+        sys.stdout.flush()
+        printed = len(lines)
+
+        key = read_key()
+        if key == "up":
+            index = (index - 1) % len(models)
+        elif key == "down":
+            index = (index + 1) % len(models)
+        elif key == "enter":
+            return models[index]
+
+
+def list_models(client) -> list[str]:
+    names = set()
+    for model in client.models.list():
+        name = (model.name or "").removeprefix("models/")
+        actions = model.supported_actions or []
+        if "generateContent" not in actions or not name.startswith("gemini"):
+            continue
+        if any(part in name for part in EXCLUDED_MODEL_PARTS):
+            continue
+        names.add(name)
+    return sorted(names)
+
+
+def select_startup_model(client, config: dict) -> str:
+    saved = str(config.get("model", "")).strip() or DEFAULT_MODEL
+    if not sys.stdin.isatty():
+        return saved
+
+    try:
+        models = list_models(client)
+    except Exception as error:
+        print(f"Cannot load the model list: {error}")
+        return saved
+
+    if saved not in models:
+        models.insert(0, saved)
+
+    try:
+        chosen = choose_model(models, saved)
+    except KeyboardInterrupt:
+        print()
+        raise SystemExit(0)
+
+    if chosen != config.get("model"):
+        config["model"] = chosen
+        write_config(config)
+    return chosen
+
+
 def switch_model(client, chat, config: dict, new_model: str):
     """Return a new chat on new_model with the same history, or None on failure."""
     try:
@@ -180,10 +293,12 @@ def main() -> None:
         os.system("")  # enables ANSI escape codes in the Windows console
 
     print(f"{PURPLE}{APP_NAME}{RESET} {APP_VERSION}")
+    print(f"Working folder: {WORK_DIR}\n")
 
     config = read_config()
     client = genai.Client(api_key=get_api_key(config))
-    model = str(config.get("model", "")).strip() or DEFAULT_MODEL
+    model = select_startup_model(client, config)
+    print(f"Model: {model}")
     chat = client.chats.create(model=model, config=CHAT_CONFIG)
 
     while True:
