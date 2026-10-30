@@ -1,0 +1,9 @@
+# Visual Studio Code settings
+.vscode/
+
+# Python compiled files
+__pycache__/
+*.pyc
+
+# Other files
+config.json
